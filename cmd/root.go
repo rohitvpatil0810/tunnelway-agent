@@ -6,22 +6,26 @@ package cmd
 import (
 	"os"
 
+	tunnelwayagent "github.com/rohitvpatil0810/tunnelway-agent/internal/tunnelway-agent"
 	"github.com/spf13/cobra"
 )
 
+var port int16
+
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
-	Use:   "tunnelway-agent",
-	Short: "A brief description of your application",
-	Long: `A longer description that spans multiple lines and likely contains
-examples and usage of using your application. For example:
-
-Cobra is a CLI library for Go that empowers applications.
-This application is a tool to generate the needed files
-to quickly create a Cobra application.`,
-	// Uncomment the following line if your bare application
-	// has an action associated with it:
-	// Run: func(cmd *cobra.Command, args []string) { },
+	Use:   "tunnelway",
+	Short: "Tunnelway is a simple CLI tool to tunnel your local services to the internet.",
+	Long: `Tunnelway is a simple CLI tool to tunnel your local services to the internet. 
+It allows you to expose your local services to the internet without 
+the need for complex configurations or additional software. 
+	
+With Tunnelway, you can easily share your local services with others, 
+test webhooks, or access your local development environment from anywhere.`,
+	Run: func(cmd *cobra.Command, args []string) {
+		// Initialize the agent and start it
+		tunnelwayagent.Init(port)
+	},
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
@@ -42,5 +46,5 @@ func init() {
 
 	// Cobra also supports local flags, which will only run
 	// when this action is called directly.
-	rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+	rootCmd.Flags().Int16VarP(&port, "port", "p", 8080, "The local port to forward traffic to")
 }

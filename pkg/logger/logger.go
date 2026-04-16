@@ -10,6 +10,7 @@ var Log *slog.Logger
 func Init() {
 	textHandler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		AddSource: true,
+		Level:     slog.LevelDebug,
 	})
 
 	Log = slog.New(textHandler)

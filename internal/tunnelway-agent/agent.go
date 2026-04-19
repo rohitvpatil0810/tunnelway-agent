@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,7 +13,7 @@ import (
 )
 
 type Agent struct {
-	conn         *websocket.Conn
+	ID           string
 	internalPort int16
 	Received     chan *TunnelRequest
 	Send         chan *TunnelResponse
@@ -22,7 +23,14 @@ type Agent struct {
 
 	LastHeartBeat time.Time
 
-	Closed chan struct{}
+	stateMu sync.RWMutex
+	state   *connectionState
+}
+
+type connectionState struct {
+	conn      *websocket.Conn
+	closed    chan struct{}
+	closeOnce sync.Once
 }
 
 type TunnelResponse struct {
@@ -43,69 +51,153 @@ type TunnelRequest struct {
 }
 
 func Init(port int16) {
-	// Initialize the logger
 	logger.Init()
 
-	// Register the agent with the remote server
-	err := registerAgent(port)
-	if err != nil {
+	if err := registerAgent(port); err != nil {
 		logger.Log.Error("Failed to register agent", "error", err)
-		return
 	}
 }
 
 func registerAgent(port int16) error {
-	// construct server websocket URL
-	u := url.URL{
-		Scheme: "ws",
-		Host:   "localhost:6000",
-		Path:   "/_ws/agent",
-	}
-
-	// Dial the websocket
-	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	conn, message, err := dialAgent("")
 	if err != nil {
-		logger.Log.Error("Failed to dial websocket", "error", err)
 		return err
-	}
-
-	// read first message from server (it returns the public)
-	defer conn.Close()
-	var message map[string]string
-	err = conn.ReadJSON(&message)
-	if err != nil {
-		logger.Log.Error("websocket read error", "error", err)
 	}
 
 	logger.Log.Info("Serving public traffic on ", "url", message["subdomain"])
 
 	agent := &Agent{
-		conn:         conn,
-		internalPort: port,
-		// make buffer of 128, to allow up to 128 messages to be queued
+		ID:            extractAgentID(message["subdomain"]),
+		internalPort:  port,
 		Received:      make(chan *TunnelRequest, 128),
 		Pending:       make(map[string]bool),
 		Send:          make(chan *TunnelResponse, 128),
 		LastHeartBeat: time.Now(),
-		Closed:        make(chan struct{}),
 	}
-	go agent.startReadLoop()
-	go agent.processReceivedMessages()
-	go agent.startWriteLoop()
 
-	// keep the main goroutine alive forever, until the connection is closed
-	select {
-	case <-agent.Closed:
-		logger.Log.Info("Connection closed, exiting")
-		return nil
+	state := agent.setConnectionState(conn)
+	go agent.processReceivedMessages()
+	agent.startConnectionLoops(state)
+
+	for {
+		<-state.closed
+		logger.Log.Info("Connection closed, retrying...")
+		state = agent.retryConnection()
 	}
 }
 
-func (a *Agent) startReadLoop() {
+func dialAgent(agentID string) (*websocket.Conn, map[string]string, error) {
+	u := url.URL{
+		Scheme: "ws",
+		Host:   "localhost:6000",
+		Path:   "/_ws/agent",
+	}
+	if agentID != "" {
+		query := u.Query()
+		query.Set("agent_id", agentID)
+		u.RawQuery = query.Encode()
+	}
+
+	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	if err != nil {
+		logger.Log.Error("Failed to dial websocket", "error", err)
+		return nil, nil, err
+	}
+
+	var message map[string]string
+	if err := conn.ReadJSON(&message); err != nil {
+		logger.Log.Error("websocket read error", "error", err)
+		conn.Close()
+		return nil, nil, err
+	}
+
+	return conn, message, nil
+}
+
+func extractAgentID(subdomain string) string {
+	parts := strings.SplitN(subdomain, ".", 2)
+	if len(parts) == 0 {
+		return subdomain
+	}
+	return parts[0]
+}
+
+func (a *Agent) setConnectionState(conn *websocket.Conn) *connectionState {
+	state := &connectionState{
+		conn:   conn,
+		closed: make(chan struct{}),
+	}
+
+	a.stateMu.Lock()
+	a.state = state
+	a.stateMu.Unlock()
+
+	return state
+}
+
+func (a *Agent) startConnectionLoops(state *connectionState) {
+	go a.startReadLoop(state)
+	go a.startWriteLoop(state)
+	go a.startHeartBeat(state)
+}
+
+func (a *Agent) retryConnection() *connectionState {
+	backoff := time.Second
+
 	for {
-		_, msg, err := a.conn.ReadMessage()
+		conn, message, err := dialAgent(a.ID)
+		if err != nil {
+			time.Sleep(backoff)
+			backoff *= 2
+			if backoff > time.Minute {
+				backoff = time.Minute
+			}
+			continue
+		}
+
+		if subdomain := message["subdomain"]; subdomain != "" {
+			a.ID = extractAgentID(subdomain)
+			logger.Log.Info("Serving public traffic on ", "url", subdomain)
+		}
+
+		state := a.setConnectionState(conn)
+		logger.Log.Info("Reconnected to server")
+		a.startConnectionLoops(state)
+		return state
+	}
+}
+
+func (a *Agent) startHeartBeat(state *connectionState) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := state.conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
+				logger.Log.Error("Failed to send heartbeat", "error", err)
+				a.signalClosed(state)
+				return
+			}
+		case <-state.closed:
+			return
+		}
+	}
+}
+
+func (a *Agent) signalClosed(state *connectionState) {
+	state.closeOnce.Do(func() {
+		close(state.closed)
+		state.conn.Close()
+	})
+}
+
+func (a *Agent) startReadLoop(state *connectionState) {
+	for {
+		_, msg, err := state.conn.ReadMessage()
 		if err != nil {
 			logger.Log.Error("websocket read error", "error", err)
+			a.signalClosed(state)
 			return
 		}
 
@@ -124,7 +216,6 @@ func (a *Agent) startReadLoop() {
 
 func (a *Agent) processReceivedMessages() {
 	for request := range a.Received {
-		// Process the request and generate a response
 		logger.Log.Debug("Processing Request", "requestId", request.ID, "method", request.Method, "path", request.Path)
 		response, err := ForwardRequest(a.internalPort, request)
 		if err != nil {
@@ -135,17 +226,22 @@ func (a *Agent) processReceivedMessages() {
 	}
 }
 
-func (a *Agent) startWriteLoop() {
-	for response := range a.Send {
-		logger.Log.Debug("Sending Response", "responseId", response.ID, "status", response.Status)
-		err := a.conn.WriteJSON(response)
-		if err != nil {
-			logger.Log.Error("websocket write error", "error", err)
+func (a *Agent) startWriteLoop(state *connectionState) {
+	for {
+		select {
+		case <-state.closed:
 			return
+		case response := <-a.Send:
+			logger.Log.Debug("Sending Response", "responseId", response.ID, "status", response.Status)
+			if err := state.conn.WriteJSON(response); err != nil {
+				logger.Log.Error("websocket write error", "error", err)
+				a.signalClosed(state)
+				return
+			}
+
+			a.PendingMu.Lock()
+			delete(a.Pending, response.ID)
+			a.PendingMu.Unlock()
 		}
-		a.PendingMu.Lock()
-		// remove the request ID from pending
-		delete(a.Pending, response.ID)
-		a.PendingMu.Unlock()
 	}
 }

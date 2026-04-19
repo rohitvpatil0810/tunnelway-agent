@@ -220,7 +220,12 @@ func (a *Agent) processReceivedMessages() {
 		response, err := ForwardRequest(a.internalPort, request)
 		if err != nil {
 			logger.Log.Error("Error forwarding request", "error", err)
-			continue
+			// Send an error response back to the server
+			response = &TunnelResponse{
+				ID:     request.ID,
+				Status: http.StatusInternalServerError,
+				Body:   "Internal Server Error: " + err.Error(),
+			}
 		}
 		a.Send <- response
 	}

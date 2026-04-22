@@ -21,6 +21,9 @@ func requestWorker(ID int, agent *Agent) {
 				Body:   "Internal Server Error: " + err.Error(),
 			}
 		}
-		agent.Send <- response
+		agent.Send <- &OutBoundMessage{
+			kind:     OutBoundResponse,
+			response: response,
+		}
 	}
 }

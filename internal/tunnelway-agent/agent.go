@@ -12,11 +12,18 @@ import (
 	"github.com/rohitvpatil0810/tunnelway-agent/pkg/logger"
 )
 
+type OutBounKind int
+
+const (
+	OutBoundResponse OutBounKind = iota
+	OutBoundHeartBeat
+)
+
 type Agent struct {
 	ID           string
 	internalPort int16
 	Received     chan *TunnelRequest
-	Send         chan *TunnelResponse
+	Send         chan *OutBoundMessage
 
 	PendingMu sync.Mutex
 	Pending   map[string]bool
@@ -33,6 +40,11 @@ type connectionState struct {
 	conn      *websocket.Conn
 	closed    chan struct{}
 	closeOnce sync.Once
+}
+
+type OutBoundMessage struct {
+	kind     OutBounKind
+	response *TunnelResponse
 }
 
 type TunnelResponse struct {
@@ -73,7 +85,7 @@ func registerAgent(port int16) error {
 		internalPort:  port,
 		Received:      make(chan *TunnelRequest, 128),
 		Pending:       make(map[string]bool),
-		Send:          make(chan *TunnelResponse, 128),
+		Send:          make(chan *OutBoundMessage, 128),
 		LastHeartBeat: time.Now(),
 		workerCount:   8, // Set the desired number of workers
 	}
@@ -177,10 +189,8 @@ func (a *Agent) startHeartBeat(state *connectionState) {
 	for {
 		select {
 		case <-ticker.C:
-			if err := state.conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
-				logger.Log.Error("Failed to send heartbeat", "error", err)
-				a.signalClosed(state)
-				return
+			a.Send <- &OutBoundMessage{
+				kind: OutBoundHeartBeat,
 			}
 		case <-state.closed:
 			return
@@ -228,17 +238,32 @@ func (a *Agent) startWriteLoop(state *connectionState) {
 		select {
 		case <-state.closed:
 			return
-		case response := <-a.Send:
-			logger.Log.Debug("Sending Response", "responseId", response.ID, "status", response.Status)
-			if err := state.conn.WriteJSON(response); err != nil {
-				logger.Log.Error("websocket write error", "error", err)
-				a.signalClosed(state)
-				return
+		case outBoundMessage := <-a.Send:
+
+			switch outBoundMessage.kind {
+			case OutBoundHeartBeat:
+				// Just send a ping message for heartbeat
+				if err := state.conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
+					logger.Log.Error("websocket write error", "error", err)
+					a.signalClosed(state)
+					return
+				}
+				continue
+			case OutBoundResponse:
+				// Send the actual response back to the server
+				response := outBoundMessage.response
+				logger.Log.Debug("Sending Response", "responseId", response.ID, "status", response.Status)
+				if err := state.conn.WriteJSON(response); err != nil {
+					logger.Log.Error("websocket write error", "error", err)
+					a.signalClosed(state)
+					return
+				}
+
+				a.PendingMu.Lock()
+				delete(a.Pending, response.ID)
+				a.PendingMu.Unlock()
 			}
 
-			a.PendingMu.Lock()
-			delete(a.Pending, response.ID)
-			a.PendingMu.Unlock()
 		}
 	}
 }

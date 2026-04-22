@@ -25,6 +25,8 @@ type Agent struct {
 
 	stateMu sync.RWMutex
 	state   *connectionState
+
+	workerCount int
 }
 
 type connectionState struct {
@@ -73,10 +75,11 @@ func registerAgent(port int16) error {
 		Pending:       make(map[string]bool),
 		Send:          make(chan *TunnelResponse, 128),
 		LastHeartBeat: time.Now(),
+		workerCount:   8, // Set the desired number of workers
 	}
 
 	state := agent.setConnectionState(conn)
-	go agent.processReceivedMessages()
+	agent.startRequestWorkers()
 	agent.startConnectionLoops(state)
 
 	for {
@@ -207,27 +210,16 @@ func (a *Agent) startReadLoop(state *connectionState) {
 			continue
 		}
 
-		a.Received <- request
 		a.PendingMu.Lock()
 		a.Pending[request.ID] = true
 		a.PendingMu.Unlock()
+		a.Received <- request
 	}
 }
 
-func (a *Agent) processReceivedMessages() {
-	for request := range a.Received {
-		logger.Log.Debug("Processing Request", "requestId", request.ID, "method", request.Method, "path", request.Path)
-		response, err := ForwardRequest(a.internalPort, request)
-		if err != nil {
-			logger.Log.Error("Error forwarding request", "error", err)
-			// Send an error response back to the server
-			response = &TunnelResponse{
-				ID:     request.ID,
-				Status: http.StatusInternalServerError,
-				Body:   "Internal Server Error: " + err.Error(),
-			}
-		}
-		a.Send <- response
+func (a *Agent) startRequestWorkers() {
+	for i := 0; i < a.workerCount; i++ {
+		go requestWorker(i, a)
 	}
 }
 

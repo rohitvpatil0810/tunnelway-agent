@@ -369,6 +369,20 @@ func (a *Agent) currentState() *connectionState {
 	return a.state
 }
 
+func (a *Agent) cleanupRequestStream(requestID string) {
+	a.ReceivedMu.Lock()
+	stream, exists := a.Received[requestID]
+	if exists {
+		delete(a.Received, requestID)
+	}
+	a.ReceivedMu.Unlock()
+
+	if exists {
+		_ = stream.pr.Close()
+		_ = stream.pw.Close()
+	}
+}
+
 func (a *Agent) SendFrame(frame *Frame) (<-chan struct{}, error) {
 	state := a.currentState()
 	if state == nil {
@@ -392,6 +406,8 @@ func (a *Agent) SendFrame(frame *Frame) (<-chan struct{}, error) {
 }
 
 func (a *Agent) StreamResponse(requestId string, response *http.Response) error {
+	defer a.cleanupRequestStream(requestId)
+
 	// 1. Send response start frame
 	var meta struct {
 		StatusCode int
@@ -448,11 +464,6 @@ func (a *Agent) StreamResponse(requestId string, response *http.Response) error 
 		logger.Log.Error("Failed to send response end frame", "error", err)
 		return err
 	}
-
-	// 4. Clean up the received request stream
-	a.ReceivedMu.Lock()
-	delete(a.Received, requestId)
-	a.ReceivedMu.Unlock()
 
 	return nil
 }

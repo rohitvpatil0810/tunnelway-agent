@@ -2,7 +2,9 @@ package tunnelwayagent
 
 import (
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 
 	"github.com/rohitvpatil0810/tunnelway-agent/pkg/logger"
 )
@@ -46,6 +48,22 @@ func requestWorker(ID int, agent *Agent) {
 	for requestStream := range agent.RequestQueue {
 
 		logger.Log.Debug("Processing Request: ", "workerID", ID, "requestId", requestStream.ID, "method", requestStream.Method, "path", requestStream.URL)
-		ForwardRequest(agent, requestStream)
+		err := ForwardRequest(agent, requestStream)
+		if err != nil {
+			logger.Log.Error("Forward request failed", "requestId", requestStream.ID, "error", err)
+
+			// Send fallback upstream response so server unblocks immediately.
+			fallback := &http.Response{
+				StatusCode: http.StatusBadGateway,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("upstream request failed")),
+			}
+
+			fallback.Header.Set("Content-Type", "text/plain; charset=utf-8")
+
+			if streamErr := agent.StreamResponse(requestStream.ID, fallback); streamErr != nil {
+				logger.Log.Error("Failed to stream fallback response", "requestId", requestStream.ID, "error", streamErr)
+			}
+		}
 	}
 }

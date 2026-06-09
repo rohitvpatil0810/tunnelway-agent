@@ -449,6 +449,11 @@ func (a *Agent) StreamResponse(requestId string, response *http.Response) error 
 		return err
 	}
 
+	// 4. Clean up the received request stream
+	a.ReceivedMu.Lock()
+	delete(a.Received, requestId)
+	a.ReceivedMu.Unlock()
+
 	return nil
 }
 

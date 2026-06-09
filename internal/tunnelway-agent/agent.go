@@ -123,8 +123,10 @@ func registerAgent(port int16) error {
 
 func dialAgent(agentID string) (*websocket.Conn, map[string]string, error) {
 	u := url.URL{
-		Scheme: "wss",
-		Host:   "tunnelway.online",
+		// Scheme: "wss",
+		// Host:   "tunnelway.online",
+		Scheme: "ws",
+		Host:   "localhost:7000",
 		Path:   "/_ws/agent",
 	}
 	if agentID != "" {
@@ -464,6 +466,8 @@ func (a *Agent) StreamResponse(requestId string, response *http.Response) error 
 		logger.Log.Error("Failed to send response end frame", "error", err)
 		return err
 	}
+
+	logger.Log.Debug("Finished streaming response", "requestId", requestId, "statusCode", response.StatusCode)
 
 	return nil
 }

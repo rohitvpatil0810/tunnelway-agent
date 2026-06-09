@@ -1,7 +1,10 @@
 package tunnelwayagent
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -19,23 +22,6 @@ const (
 	OutBoundHeartBeat
 )
 
-type Agent struct {
-	ID           string
-	internalPort int16
-	Received     chan *TunnelRequest
-	Send         chan *OutBoundMessage
-
-	PendingMu sync.Mutex
-	Pending   map[string]bool
-
-	LastHeartBeat time.Time
-
-	stateMu sync.RWMutex
-	state   *connectionState
-
-	workerCount int
-}
-
 type connectionState struct {
 	conn      *websocket.Conn
 	closed    chan struct{}
@@ -43,25 +29,57 @@ type connectionState struct {
 }
 
 type OutBoundMessage struct {
-	kind     OutBounKind
-	response *TunnelResponse
+	kind  OutBounKind
+	frame *Frame
 }
 
-type TunnelResponse struct {
-	ID      string
-	Status  int
-	Headers http.Header
-	// Body    []byte `json:"Body"`
-	// TODO: change to byte again - for testing changed to string
-	Body string `json:"Body"`
+type Agent struct {
+	ID           string
+	internalPort int16
+
+	ReceivedMu sync.Mutex
+	Received   map[string]*RequestStream
+
+	Send chan *OutBoundMessage
+
+	LastHeartBeat time.Time
+
+	stateMu sync.RWMutex
+	state   *connectionState
+
+	RequestQueue chan *RequestStream
+
+	workerCount int
 }
 
-type TunnelRequest struct {
-	ID      string
-	Method  string
-	Path    string
-	Headers http.Header
-	Body    []byte
+type FrameType int
+
+const (
+	FrameRequestStart FrameType = iota
+	FrameRequestBodyChunk
+	FrameRequestBodyEnd
+	FrameResponseStart
+	FrameResponseBodyChunk
+	FrameResponseBodyEnd
+)
+
+type RequestStream struct {
+	requestStart RequestStart
+
+	pr *io.PipeReader
+	pw *io.PipeWriter
+}
+
+type RequestStart struct {
+	Method  string      `json:"method"`
+	URL     string      `json:"url"`
+	Headers http.Header `json:"headers"`
+}
+
+type Frame struct {
+	Type      FrameType
+	RequestID string
+	Data      []byte
 }
 
 func Init(port int16) {
@@ -83,8 +101,8 @@ func registerAgent(port int16) error {
 	agent := &Agent{
 		ID:            extractAgentID(message["subdomain"]),
 		internalPort:  port,
-		Received:      make(chan *TunnelRequest, 128),
-		Pending:       make(map[string]bool),
+		Received:      make(map[string]*RequestStream),
+		RequestQueue:  make(chan *RequestStream, 128),
 		Send:          make(chan *OutBoundMessage, 128),
 		LastHeartBeat: time.Now(),
 		workerCount:   8, // Set the desired number of workers
@@ -103,8 +121,8 @@ func registerAgent(port int16) error {
 
 func dialAgent(agentID string) (*websocket.Conn, map[string]string, error) {
 	u := url.URL{
-		Scheme: "ws",
-		Host:   "localhost:6000",
+		Scheme: "wss",
+		Host:   "tunnelway.online",
 		Path:   "/_ws/agent",
 	}
 	if agentID != "" {
@@ -205,6 +223,87 @@ func (a *Agent) signalClosed(state *connectionState) {
 	})
 }
 
+func decodeFrame(data []byte) (*Frame, error) {
+	reader := bytes.NewReader(data)
+
+	// 1 byte for frame type
+	frameTypeByte, err := reader.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+
+	idLen, err := reader.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+
+	idBytes := make([]byte, idLen)
+	if _, err := io.ReadFull(reader, idBytes); err != nil {
+		return nil, err
+	}
+
+	var payloadLen uint32
+	if err := binary.Read(reader, binary.BigEndian, &payloadLen); err != nil {
+		return nil, err
+	}
+
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(reader, payload); err != nil {
+		return nil, err
+	}
+
+	return &Frame{
+		Type:      FrameType(frameTypeByte),
+		RequestID: string(idBytes),
+		Data:      payload,
+	}, nil
+}
+
+func (a *Agent) handleRequestFrame(frame *Frame) {
+	switch frame.Type {
+	case FrameRequestStart:
+		var requestStart RequestStart
+		if err := json.Unmarshal(frame.Data, &requestStart); err != nil {
+			logger.Log.Error("Failed to unmarshal request start frame", "error", err)
+			return
+		}
+
+		pr, pw := io.Pipe()
+		var requestStream = &RequestStream{
+			requestStart: requestStart,
+			pr:           pr,
+			pw:           pw,
+		}
+		a.ReceivedMu.Lock()
+		a.Received[frame.RequestID] = requestStream
+		a.ReceivedMu.Unlock()
+
+		a.RequestQueue <- requestStream
+
+	case FrameRequestBodyChunk:
+		a.ReceivedMu.Lock()
+		stream, exists := a.Received[frame.RequestID]
+		a.ReceivedMu.Unlock()
+		if !exists {
+			logger.Log.Error("Received body chunk for unknown request ID", "requestID", frame.RequestID)
+			return
+		}
+		if _, err := stream.pw.Write(frame.Data); err != nil {
+			logger.Log.Error("Failed to write to request body pipe", "error", err)
+		}
+
+	case FrameRequestBodyEnd:
+		a.ReceivedMu.Lock()
+		stream, exists := a.Received[frame.RequestID]
+		a.ReceivedMu.Unlock()
+		if !exists {
+			logger.Log.Error("Received body end for unknown request ID", "requestID", frame.RequestID)
+			return
+		}
+		stream.pw.Close()
+	}
+}
+
 func (a *Agent) startReadLoop(state *connectionState) {
 	for {
 		_, msg, err := state.conn.ReadMessage()
@@ -214,16 +313,13 @@ func (a *Agent) startReadLoop(state *connectionState) {
 			return
 		}
 
-		request := &TunnelRequest{}
-		if err := json.Unmarshal(msg, request); err != nil {
-			logger.Log.Error("Error unmarshalling json", "error", err)
+		frame, err := decodeFrame(msg)
+		if err != nil {
+			logger.Log.Error("Failed to decode frame", "error", err)
 			continue
 		}
 
-		a.PendingMu.Lock()
-		a.Pending[request.ID] = true
-		a.PendingMu.Unlock()
-		a.Received <- request
+		a.handleRequestFrame(frame)
 	}
 }
 
@@ -263,7 +359,6 @@ func (a *Agent) startWriteLoop(state *connectionState) {
 				delete(a.Pending, response.ID)
 				a.PendingMu.Unlock()
 			}
-
 		}
 	}
 }

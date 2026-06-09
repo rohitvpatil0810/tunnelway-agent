@@ -398,6 +398,9 @@ func (a *Agent) StreamResponse(requestId string, response *http.Response) error 
 		Headers    http.Header
 	}
 
+	meta.StatusCode = response.StatusCode
+	meta.Headers = response.Header.Clone()
+
 	startFrameData, _ := json.Marshal(meta)
 
 	_, err := a.SendFrame(&Frame{
@@ -468,7 +471,7 @@ func (a *Agent) startWriteLoop(state *connectionState) {
 			case OutBoundResponse:
 				// Send the actual response back to the server
 				frame := outBoundMessage.frame
-				if err := state.conn.WriteJSON(frame); err != nil {
+				if err := state.conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
 					logger.Log.Error("websocket write error", "error", err)
 					a.signalClosed(state)
 					return

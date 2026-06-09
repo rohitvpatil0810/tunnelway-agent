@@ -10,16 +10,16 @@ import (
 func ForwardRequest(agent *Agent, request *RequestStream) error {
 	// forward the request to the local server and return local response
 	// construct the URL
-	url := fmt.Sprintf("http://localhost:%d%s", agent.internalPort, request.requestStart.URL)
+	url := fmt.Sprintf("http://localhost:%d%s", agent.internalPort, request.URL)
 
 	// create a new HTTP request with the same method, URL, headers and body as the incoming request
-	req, err := http.NewRequest(request.requestStart.Method, url, request.pr)
+	req, err := http.NewRequest(request.Method, url, request.pr)
 	if err != nil {
 		logger.Log.Error("Failed to create new HTTP request", "error", err)
 		return err
 	}
 
-	req.Header = request.requestStart.Headers
+	req.Header = request.Headers.Clone()
 
 	// send the request to the local server
 	client := &http.Client{}
@@ -44,9 +44,8 @@ func requestWorker(ID int, agent *Agent) {
 	logger.Init()
 	logger.Log.Info("Starting request worker", "ID", ID)
 	for requestStream := range agent.RequestQueue {
-		request := requestStream.requestStart
 
-		logger.Log.Debug("Processing Request: ", "workerID", ID, "requestId", requestStream.ID, "method", request.Method, "path", request.URL)
+		logger.Log.Debug("Processing Request: ", "workerID", ID, "requestId", requestStream.ID, "method", requestStream.Method, "path", requestStream.URL)
 		ForwardRequest(agent, requestStream)
 	}
 }

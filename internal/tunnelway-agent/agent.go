@@ -65,8 +65,8 @@ const (
 )
 
 type RequestStream struct {
-	ID           string
-	requestStart RequestStart
+	ID string
+	RequestStart
 
 	pr *io.PipeReader
 	pw *io.PipeWriter
@@ -273,7 +273,7 @@ func (a *Agent) handleRequestFrame(frame *Frame) {
 		pr, pw := io.Pipe()
 		var requestStream = &RequestStream{
 			ID:           frame.RequestID,
-			requestStart: requestStart,
+			RequestStart: requestStart,
 			pr:           pr,
 			pw:           pw,
 		}

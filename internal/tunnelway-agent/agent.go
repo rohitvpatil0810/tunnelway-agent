@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -30,7 +31,7 @@ type connectionState struct {
 
 type OutBoundMessage struct {
 	kind  OutBounKind
-	frame *Frame
+	frame []byte
 }
 
 type Agent struct {
@@ -64,6 +65,7 @@ const (
 )
 
 type RequestStream struct {
+	ID           string
 	requestStart RequestStart
 
 	pr *io.PipeReader
@@ -270,6 +272,7 @@ func (a *Agent) handleRequestFrame(frame *Frame) {
 
 		pr, pw := io.Pipe()
 		var requestStream = &RequestStream{
+			ID:           frame.RequestID,
 			requestStart: requestStart,
 			pr:           pr,
 			pw:           pw,
@@ -329,6 +332,123 @@ func (a *Agent) startRequestWorkers() {
 	}
 }
 
+func encodeFrame(frame *Frame) ([]byte, error) {
+	buf := bytes.NewBuffer(nil)
+
+	// 1 byte for frame type
+	if err := buf.WriteByte(byte(frame.Type)); err != nil {
+		return nil, err
+	}
+
+	// request ID length + value
+	idBytes := []byte(frame.RequestID)
+	if len(idBytes) > 255 {
+		return nil, errors.New("request ID too long")
+	}
+	if err := buf.WriteByte(byte(len(idBytes))); err != nil {
+		return nil, err
+	}
+	if _, err := buf.Write(idBytes); err != nil {
+		return nil, err
+	}
+
+	// payload length (4 bytes)
+	if err := binary.Write(buf, binary.BigEndian, uint32(len(frame.Data))); err != nil {
+		return nil, err
+	}
+	if _, err := buf.Write(frame.Data); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+func (a *Agent) currentState() *connectionState {
+	a.stateMu.RLock()
+	defer a.stateMu.RUnlock()
+	return a.state
+}
+
+func (a *Agent) SendFrame(frame *Frame) (<-chan struct{}, error) {
+	state := a.currentState()
+	if state == nil {
+		return nil, errors.New("agent has no active connection")
+	}
+
+	encoded, err := encodeFrame(frame)
+	if err != nil {
+		return nil, err
+	}
+
+	select {
+	case <-state.closed:
+		return nil, errors.New("agent connection is closed")
+	case a.Send <- &OutBoundMessage{
+		kind:  OutBoundResponse,
+		frame: encoded,
+	}:
+		return state.closed, nil
+	}
+}
+
+func (a *Agent) StreamResponse(requestId string, response *http.Response) error {
+	// 1. Send response start frame
+	var meta struct {
+		StatusCode int
+		Headers    http.Header
+	}
+
+	startFrameData, _ := json.Marshal(meta)
+
+	_, err := a.SendFrame(&Frame{
+		Type:      FrameResponseStart,
+		RequestID: requestId,
+		Data:      startFrameData,
+	})
+	if err != nil {
+		logger.Log.Error("Failed to send response start frame", "error", err)
+		return err
+	}
+
+	// 2. Stream response body in chunks
+	buf := make([]byte, 1024*32) // 32KB buffer
+	for {
+		n, err := response.Body.Read(buf)
+		if n > 0 {
+			chunkData := buf[:n]
+			_, err := a.SendFrame(&Frame{
+				Type:      FrameResponseBodyChunk,
+				RequestID: requestId,
+				Data:      append([]byte(nil), chunkData...), // Copy the chunk data
+			})
+			if err != nil {
+				logger.Log.Error("Failed to send response body chunk", "error", err)
+				return err
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			logger.Log.Error("Error reading response body", "error", err)
+			return err
+		}
+	}
+
+	// 3. Send response end frame
+	_, err = a.SendFrame(&Frame{
+		Type:      FrameResponseBodyEnd,
+		RequestID: requestId,
+		Data:      nil,
+	})
+	if err != nil {
+		logger.Log.Error("Failed to send response end frame", "error", err)
+		return err
+	}
+
+	return nil
+}
+
 func (a *Agent) startWriteLoop(state *connectionState) {
 	for {
 		select {
@@ -347,17 +467,12 @@ func (a *Agent) startWriteLoop(state *connectionState) {
 				continue
 			case OutBoundResponse:
 				// Send the actual response back to the server
-				response := outBoundMessage.response
-				logger.Log.Debug("Sending Response", "responseId", response.ID, "status", response.Status)
-				if err := state.conn.WriteJSON(response); err != nil {
+				frame := outBoundMessage.frame
+				if err := state.conn.WriteJSON(frame); err != nil {
 					logger.Log.Error("websocket write error", "error", err)
 					a.signalClosed(state)
 					return
 				}
-
-				a.PendingMu.Lock()
-				delete(a.Pending, response.ID)
-				a.PendingMu.Unlock()
 			}
 		}
 	}

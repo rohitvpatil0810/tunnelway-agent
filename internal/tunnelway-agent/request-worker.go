@@ -31,7 +31,13 @@ func ForwardRequest(agent *Agent, request *RequestStream) error {
 	defer resp.Body.Close()
 
 	// TODO: stream the response back to the agent
+	err = agent.StreamResponse(request.ID, resp)
+	if err != nil {
+		logger.Log.Error("Failed to stream response back to agent", "error", err)
+		return err
+	}
 
+	return nil
 }
 
 func requestWorker(ID int, agent *Agent) {
@@ -40,7 +46,7 @@ func requestWorker(ID int, agent *Agent) {
 	for requestStream := range agent.RequestQueue {
 		request := requestStream.requestStart
 
-		logger.Log.Debug("Processing Request: ", "workerID", ID, "requestId", request.ID, "method", request.Method, "path", request.URL)
+		logger.Log.Debug("Processing Request: ", "workerID", ID, "requestId", requestStream.ID, "method", request.Method, "path", request.URL)
 		ForwardRequest(agent, requestStream)
 	}
 }

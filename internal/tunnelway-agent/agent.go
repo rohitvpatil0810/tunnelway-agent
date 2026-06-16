@@ -37,6 +37,7 @@ type OutBoundMessage struct {
 type Agent struct {
 	ID           string
 	internalPort int16
+	serverURL    string
 
 	ReceivedMu sync.Mutex
 	Received   map[string]*RequestStream
@@ -84,16 +85,16 @@ type Frame struct {
 	Data      []byte
 }
 
-func Init(port int16) {
+func Init(port int16, serverURL string) {
 	logger.Init()
 
-	if err := registerAgent(port); err != nil {
+	if err := registerAgent(port, serverURL); err != nil {
 		logger.Log.Error("Failed to register agent", "error", err)
 	}
 }
 
-func registerAgent(port int16) error {
-	conn, message, err := dialAgent("")
+func registerAgent(port int16, serverURL string) error {
+	conn, message, err := dialAgent(serverURL, "")
 	if err != nil {
 		return err
 	}
@@ -103,6 +104,7 @@ func registerAgent(port int16) error {
 	agent := &Agent{
 		ID:            extractAgentID(message["subdomain"]),
 		internalPort:  port,
+		serverURL:     serverURL,
 		Received:      make(map[string]*RequestStream),
 		RequestQueue:  make(chan *RequestStream, 128),
 		Send:          make(chan *OutBoundMessage, 128),
@@ -121,14 +123,12 @@ func registerAgent(port int16) error {
 	}
 }
 
-func dialAgent(agentID string) (*websocket.Conn, map[string]string, error) {
-	u := url.URL{
-		// Scheme: "wss",
-		// Host:   "tunnelway.online",
-		Scheme: "ws",
-		Host:   "localhost:7000",
-		Path:   "/_ws/agent",
+func dialAgent(serverURL, agentID string) (*websocket.Conn, map[string]string, error) {
+	u, err := url.Parse(serverURL)
+	if err != nil {
+		return nil, nil, err
 	}
+
 	if agentID != "" {
 		query := u.Query()
 		query.Set("agent_id", agentID)
@@ -182,7 +182,7 @@ func (a *Agent) retryConnection() *connectionState {
 	backoff := time.Second
 
 	for {
-		conn, message, err := dialAgent(a.ID)
+		conn, message, err := dialAgent(a.serverURL, a.ID)
 		if err != nil {
 			time.Sleep(backoff)
 			backoff *= 2
